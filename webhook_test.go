@@ -10,6 +10,10 @@ import (
 
 const secret = "whsec_test"
 
+// atFixture sets the webhook clock to the created_at of the fixtures below,
+// so the age check sees them as fresh.
+var atFixture = WithWebhookClock(func() time.Time { return time.UnixMilli(1893553445678) })
+
 const checkoutCompleted = `{"id":"evt_1","eventType":"checkout.completed","created_at":1893553445678,
 "object":{"id":"ch_1","object":"checkout","request_id":"purchase-9","status":"completed","mode":"test",
 "metadata":{"purchase":"p_9"},
@@ -21,7 +25,7 @@ const checkoutCompleted = `{"id":"evt_1","eventType":"checkout.completed","creat
 
 func TestWebhookCheckoutCompleted(t *testing.T) {
 	body := []byte(checkoutCompleted)
-	ev, err := NewWebhook(secret).Parse(Sign(secret, body), body)
+	ev, err := NewWebhook(secret, atFixture).Parse(Sign(secret, body), body)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,7 +44,7 @@ func TestWebhookCheckoutCompleted(t *testing.T) {
 }
 
 func TestWebhookRefundAndDispute(t *testing.T) {
-	wh := NewWebhook(secret)
+	wh := NewWebhook(secret, atFixture)
 	parse := func(s string) *Event {
 		t.Helper()
 		ev, err := wh.Parse(Sign(secret, []byte(s)), []byte(s))
@@ -77,25 +81,25 @@ func TestWebhookRejects(t *testing.T) {
 		body []byte
 		wh   *Webhook
 	}{
-		"empty":         {"", body, NewWebhook(secret)},
-		"not hex":       {"zz", body, NewWebhook(secret)},
-		"wrong secret":  {Sign("other", body), body, NewWebhook(secret)},
-		"tampered body": {Sign(secret, body), bytes.Replace(body, []byte("1500"), []byte("150"), 1), NewWebhook(secret)},
-		"no secret":     {Sign("", body), body, NewWebhook("")},
+		"empty":         {"", body, NewWebhook(secret, atFixture)},
+		"not hex":       {"zz", body, NewWebhook(secret, atFixture)},
+		"wrong secret":  {Sign("other", body), body, NewWebhook(secret, atFixture)},
+		"tampered body": {Sign(secret, body), bytes.Replace(body, []byte("1500"), []byte("150"), 1), NewWebhook(secret, atFixture)},
+		"no secret":     {Sign("", body), body, NewWebhook("", atFixture)},
 	}
 	for name, c := range cases {
 		if _, err := c.wh.Parse(c.sig, c.body); !errors.Is(err, ErrSignature) {
 			t.Errorf("%s: want ErrSignature, got %v", name, err)
 		}
 	}
-	if _, err := NewWebhook("new", WithPreviousSecret(secret)).Parse(Sign(secret, body), body); err != nil {
+	if _, err := NewWebhook("new", WithPreviousSecret(secret), atFixture).Parse(Sign(secret, body), body); err != nil {
 		t.Fatalf("the previous secret must still verify: %v", err)
 	}
-	if _, err := NewWebhook(secret).Parse(" "+Sign(secret, body)+"\n", body); err != nil {
+	if _, err := NewWebhook(secret, atFixture).Parse(" "+Sign(secret, body)+"\n", body); err != nil {
 		t.Fatalf("whitespace around the signature is tolerated: %v", err)
 	}
 	noID := []byte(`{"eventType":"checkout.completed","object":{}}`)
-	if _, err := NewWebhook(secret).Parse(Sign(secret, noID), noID); err == nil {
+	if _, err := NewWebhook(secret, atFixture).Parse(Sign(secret, noID), noID); err == nil {
 		t.Fatal("an event without an id cannot be deduplicated and must be refused")
 	}
 }
@@ -104,12 +108,12 @@ func TestWebhookRequest(t *testing.T) {
 	body := []byte(checkoutCompleted)
 	r := httptest.NewRequest("POST", "/webhooks/creem", bytes.NewReader(body))
 	r.Header.Set(SignatureHeader, Sign(secret, body))
-	if ev, err := NewWebhook(secret).ParseRequest(r); err != nil || ev.ID != "evt_1" {
+	if ev, err := NewWebhook(secret, atFixture).ParseRequest(r); err != nil || ev.ID != "evt_1" {
 		t.Fatalf("got %+v %v", ev, err)
 	}
 	r = httptest.NewRequest("POST", "/webhooks/creem", bytes.NewReader(body))
 	r.Header.Set(SignatureHeader, Sign(secret, body))
-	if _, err := NewWebhook(secret, WithMaxBody(16)).ParseRequest(r); err == nil {
+	if _, err := NewWebhook(secret, WithMaxBody(16), atFixture).ParseRequest(r); err == nil {
 		t.Fatal("an oversized body is refused")
 	}
 }

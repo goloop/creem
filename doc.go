@@ -21,17 +21,17 @@
 // the server; subscription products per term (monthly, quarterly, half-year,
 // yearly), trials and seats (UpdateSubscriptionItems); moving to another
 // product (UpgradeSubscription); scheduled cancellation and taking it back;
-// discount codes; full refunds. Not available through Creem: a recurring
-// amount decided on the server, partial refunds and invoices with payment
-// terms. Credit balances belong in goloop/ledger.
+// discount codes; full refunds. Not available through the Creem API: a
+// recurring amount decided on the server, partial refunds and invoices with
+// payment terms. Credit balances belong in goloop/ledger.
 //
 // # Webhooks
 //
 // A Webhook verifies the creem-signature header, the HMAC-SHA256 of the raw
-// body, and decodes the event. The signature carries no timestamp, so a
-// captured delivery verifies forever: deduplicating on Event.ID is not only
-// how a repeated delivery is ignored, it is the only defence against a
-// replayed one.
+// body, and decodes the event. The signature carries no timestamp, but the
+// event's created_at is in the signed body: Parse refuses an event older
+// than DefaultMaxAge with ErrEventExpired, and within that window
+// deduplicating on Event.ID is what stops a replayed delivery.
 //
 //	wh := creem.NewWebhook(os.Getenv("CREEM_WEBHOOK_SECRET"))
 //	ev, err := wh.ParseRequest(r)
@@ -46,6 +46,18 @@
 // milliseconds on others; both decode into Time. A reference to another
 // entity is an id or the expanded entity; both decode into Expandable, whose
 // ID is set either way.
+//
+// # Reconciliation
+//
+// Creem stops retrying a delivery within a day. ListTransactions lets a
+// periodic job find payments whose webhook never arrived and apply them the
+// way the webhook would.
+//
+// # Safety
+//
+// The client never follows a redirect (x-api-key would follow it to another
+// host), refuses plain HTTP except to a loopback host, admits only letters,
+// digits, "_" and "-" in an id, and never prints its key.
 //
 // # Retries
 //

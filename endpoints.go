@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 )
 
 // Custom price limits, in cents per unit.
@@ -295,4 +296,71 @@ func (c *Client) RefundTransaction(ctx context.Context, transactionID string) (s
 		return "", err
 	}
 	return out.Status, nil
+}
+
+// ListTransactionsRequest filters ListTransactions. Every field is optional.
+type ListTransactionsRequest struct {
+	CustomerID string
+	OrderID    string
+	ProductID  string
+
+	// Page is the page number, from 1; PageSize the number of items on a
+	// page. Zero leaves the API's defaults (1 and 10).
+	Page     int
+	PageSize int
+}
+
+// TransactionPage is one page of transactions. NextPage is the number to
+// pass as Page for the next one, 0 on the last page.
+type TransactionPage struct {
+	Items        []Transaction
+	NextPage     int
+	TotalRecords int
+}
+
+// ListTransactions returns a page of transactions.
+//
+// It is how a lost webhook is found: Creem stops retrying a delivery after a
+// day, and a payment whose webhook never arrived would otherwise wait for the
+// customer to complain. A periodic job that walks the transactions and
+// applies each paid one the way the webhook would closes that gap; the
+// ledger's keys make a transaction applied twice a no-op.
+func (c *Client) ListTransactions(ctx context.Context, req *ListTransactionsRequest) (*TransactionPage, error) {
+	if req == nil {
+		req = &ListTransactionsRequest{}
+	}
+	q := url.Values{}
+	for k, id := range map[string]string{"customer_id": req.CustomerID, "order_id": req.OrderID, "product_id": req.ProductID} {
+		if id == "" {
+			continue
+		}
+		if err := checkID(k, id); err != nil {
+			return nil, err
+		}
+		q.Set(k, id)
+	}
+	if req.Page < 0 || req.PageSize < 0 {
+		return nil, fmt.Errorf("%w: negative page or page size", ErrInvalid)
+	}
+	if req.Page > 0 {
+		q.Set("page_number", strconv.Itoa(req.Page))
+	}
+	if req.PageSize > 0 {
+		q.Set("page_size", strconv.Itoa(req.PageSize))
+	}
+	var out struct {
+		Items      []Transaction `json:"items"`
+		Pagination struct {
+			TotalRecords int  `json:"total_records"`
+			NextPage     *int `json:"next_page"`
+		} `json:"pagination"`
+	}
+	if err := c.do(ctx, http.MethodGet, "/v1/transactions/search", q, nil, &out); err != nil {
+		return nil, err
+	}
+	p := &TransactionPage{Items: out.Items, TotalRecords: out.Pagination.TotalRecords}
+	if out.Pagination.NextPage != nil {
+		p.NextPage = *out.Pagination.NextPage
+	}
+	return p, nil
 }

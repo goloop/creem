@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math/rand/v2"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -37,6 +39,13 @@ const maxResponse = 4 << 20
 
 // maxRetryAfter caps how long a Retry-After header can make a call wait.
 const maxRetryAfter = 60 * time.Second
+
+// MaxRetries is the most WithMaxRetries accepts. The backoff tops out at 8
+// seconds, so ten retries already wait over a minute.
+const MaxRetries = 10
+
+// maxIDLength bounds an id put into a request path.
+const maxIDLength = 128
 
 // ErrInvalid reports a request refused before it was sent.
 var ErrInvalid = errors.New("creem: invalid request")
@@ -74,9 +83,16 @@ func WithBaseURL(u string) Option {
 	return func(c *Client) { c.baseURL = strings.TrimRight(u, "/") }
 }
 
-// WithHTTPClient sets the HTTP client used for requests.
+// WithHTTPClient sets the HTTP client used for requests; nil keeps the
+// default. The client is copied, and the copy never follows a redirect: the
+// API has no reason to send one, and following it would send the request -
+// and with it the key or the body - to another host.
 func WithHTTPClient(h *http.Client) Option {
-	return func(c *Client) { c.http, c.customHTTP = h, true }
+	return func(c *Client) {
+		if h != nil {
+			c.http, c.customHTTP = h, true
+		}
+	}
 }
 
 // WithTimeout sets the per-request timeout of the default HTTP client. It
@@ -89,10 +105,10 @@ func WithTimeout(d time.Duration) Option {
 	}
 }
 
-// WithMaxRetries sets how many times a request is retried. See the package
-// documentation for which failures are retried.
+// WithMaxRetries sets how many times a request is retried, between 0 and
+// MaxRetries. See the package documentation for which failures are retried.
 func WithMaxRetries(n int) Option {
-	return func(c *Client) { c.maxRetries = max(0, n) }
+	return func(c *Client) { c.maxRetries = min(max(0, n), MaxRetries) }
 }
 
 // WithHeader adds a header sent with every request.
@@ -118,8 +134,23 @@ func New(apiKey string, opts ...Option) *Client {
 	for _, o := range opts {
 		o(c)
 	}
+	h := *c.http
+	h.CheckRedirect = noRedirect
+	c.http = &h
 	return c
 }
+
+func noRedirect(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+
+// String names the host the client talks to and never the key, so a client
+// that ends up in a log line or an error message does not leak it.
+func (c *Client) String() string { return "creem.Client(" + c.baseURL + ")" }
+
+// GoString is String, for %#v.
+func (c *Client) GoString() string { return c.String() }
+
+// LogValue implements slog.LogValuer: the host, never the key.
+func (c *Client) LogValue() slog.Value { return slog.StringValue(c.String()) }
 
 // Test reports whether the client talks to the test host.
 func (c *Client) Test() bool { return c.baseURL == TestURL }
@@ -132,6 +163,9 @@ func (c *Client) Test() bool { return c.baseURL == TestURL }
 // a refund, a cancellation - so repeating it is the caller's decision, with
 // the error in hand.
 func (c *Client) do(ctx context.Context, method, path string, query url.Values, in, out any) error {
+	if err := c.check(); err != nil {
+		return err
+	}
 	var body []byte
 	if in != nil {
 		var err error
@@ -151,6 +185,9 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 		case err != nil:
 			if ctx.Err() != nil {
 				return ctx.Err()
+			}
+			if errors.Is(err, ErrInvalid) {
+				return err // the request could not be built: retrying cannot help
 			}
 			retry = method == http.MethodGet
 			err = fmt.Errorf("creem: %s %s: %w", method, path, err)
@@ -192,7 +229,7 @@ func (c *Client) send(ctx context.Context, method, path string, body []byte) (in
 	}
 	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, rd)
 	if err != nil {
-		return 0, nil, nil, err
+		return 0, nil, nil, fmt.Errorf("%w: %v", ErrInvalid, err)
 	}
 	for k, vs := range c.headers {
 		for _, v := range vs {
@@ -209,16 +246,19 @@ func (c *Client) send(ctx context.Context, method, path string, body []byte) (in
 		return 0, nil, nil, err
 	}
 	defer res.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(res.Body, maxResponse))
+	data, err := io.ReadAll(io.LimitReader(res.Body, maxResponse+1))
 	if err != nil {
 		return 0, nil, nil, err
+	}
+	if len(data) > maxResponse {
+		return 0, nil, nil, fmt.Errorf("response larger than %d bytes", maxResponse)
 	}
 	return res.StatusCode, data, res.Header, nil
 }
 
 // backoff is 0.5s, 1s, 2s, ... with jitter, capped at 8s.
 func backoff(attempt int) time.Duration {
-	d := min(500*time.Millisecond<<attempt, 8*time.Second)
+	d := 500 * time.Millisecond << min(max(attempt, 0), 4)
 	return d/2 + rand.N(d/2+1)
 }
 
@@ -243,12 +283,45 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 	}
 }
 
+// check refuses a client that cannot be used safely: no key, or a host
+// reached over plain HTTP, which would send the key in the clear. Plain HTTP
+// is allowed to a loopback host, for a test server.
+func (c *Client) check() error {
+	if c.apiKey == "" {
+		return fmt.Errorf("%w: empty API key", ErrInvalid)
+	}
+	u, err := url.Parse(c.baseURL)
+	if err != nil || u.Host == "" {
+		return fmt.Errorf("%w: base URL %q", ErrInvalid, c.baseURL)
+	}
+	if u.Scheme != "https" && !(u.Scheme == "http" && isLoopback(u.Hostname())) {
+		return fmt.Errorf("%w: base URL %q is not https", ErrInvalid, c.baseURL)
+	}
+	return nil
+}
+
+func isLoopback(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// checkID admits the characters the provider's ids are made of and nothing
+// else. An id goes into the request path, and a denylist would always miss
+// something: "..", an escaped slash, a space.
 func checkID(what, id string) error {
 	if id == "" {
 		return fmt.Errorf("%w: empty %s id", ErrInvalid, what)
 	}
-	if strings.ContainsAny(id, "/?#") {
-		return fmt.Errorf("%w: malformed %s id %q", ErrInvalid, what, id)
+	if len(id) > maxIDLength {
+		return fmt.Errorf("%w: %s id longer than %d bytes", ErrInvalid, what, maxIDLength)
+	}
+	for _, r := range id {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '-') {
+			return fmt.Errorf("%w: malformed %s id %q", ErrInvalid, what, id)
+		}
 	}
 	return nil
 }

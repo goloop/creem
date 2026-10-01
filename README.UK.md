@@ -1,4 +1,4 @@
-[![Go Reference](https://img.shields.io/badge/godoc-reference-blue)](https://pkg.go.dev/github.com/goloop/creem) [![License](https://img.shields.io/badge/license-MIT-brightgreen)](https://github.com/goloop/creem/blob/master/LICENSE) [![Stay with Ukraine](https://img.shields.io/static/v1?label=Stay%20with&message=Ukraine%20♥&color=ffD700&labelColor=0057B8&style=flat)](https://u24.gov.ua/)
+[![deps.dev](https://img.shields.io/badge/deps.dev-insights-4c8dbc)](https://deps.dev/go/github.com%2Fgoloop%2Fcreem) [![Go Reference](https://img.shields.io/badge/godoc-reference-blue)](https://pkg.go.dev/github.com/goloop/creem) [![License](https://img.shields.io/badge/license-MIT-brightgreen)](https://github.com/goloop/creem/blob/master/LICENSE) [![Stay with Ukraine](https://img.shields.io/static/v1?label=Stay%20with&message=Ukraine%20♥&color=ffD700&labelColor=0057B8&style=flat)](https://u24.gov.ua/)
 
 # creem
 
@@ -17,15 +17,18 @@ Creem розміщує checkout, списує гроші й займається
 
 - **Сума має приходити з сервера.** Checkout створюється тут, а власна ціна
   пакета кредитів перевіряється до надсилання.
-- **Підпис вебхука не містить часу.** Перехоплена доставка проходить
-  перевірку завжди, тож id події треба зберігати й перевіряти - пакет робить
-  це явним і відхиляє події без id.
+- **Підпис вебхука не містить часу.** Перехоплена доставка проходила б
+  перевірку завжди. Пакет перевіряє `created_at` події - він у підписаному
+  тілі - і відхиляє подію, старішу за два дні, а id події однаково треба
+  зберігати й перевіряти.
 - **Формати різняться.** Час приходить то рядками ISO, то мілісекундами;
   посилання - то id, то розгорнутими об'єктами. `Time` і `Expandable` читають
   обидва варіанти, тож обробник не зламається в день, коли поле змінить
   форму.
 - **POST, що впав, міг виконатися.** Повернення чи скасування після 5xx не
   повторюються; повторюється лише те, що точно не виконалося.
+- **Загублений вебхук - загублені гроші.** Creem припиняє повтори через добу;
+  `ListTransactions` дає періодичній задачі знайти те, що не прийшло.
 
 ## Можливості
 
@@ -34,10 +37,12 @@ Creem розміщує checkout, списує гроші й займається
 - Підписки: отримати, скасувати (одразу чи в кінці періоду), призупинити,
   відновити, перейти на інший продукт, змінити кількість місць.
 - Повні повернення; клієнти за id чи email; посилання на платіжний портал;
-  транзакції.
-- Вебхуки: перевірка підпису HMAC-SHA256 з ротацією секрету; типізовані
-  checkout, підписки, повернення й спори.
-- Типізована `*APIError`; хост визначається ключем (тестовий чи бойовий).
+  транзакції - поодинці чи посторінково для звірки.
+- Вебхуки: перевірка підпису HMAC-SHA256 з ротацією секрету і перевірка
+  віку; типізовані checkout, підписки, повернення й спори.
+- Типізована `*APIError`; хост визначається ключем (тестовий чи бойовий);
+  редиректи не виконуються, id перевіряються за дозвільним списком, ключі не
+  друкуються.
 - Нуль залежностей.
 
 ## Встановлення
@@ -76,7 +81,7 @@ co, err := c.CreateCheckout(ctx, &creem.CheckoutRequest{
 
 Через Creem недоступно: регулярна сума, визначена на сервері (`CustomPrice`
 лише для разових продуктів), часткові повернення, рахунки з відтермінуванням
-і строки понад рік серед стандартних періодів оплати - для цього є Paddle.
+і строки понад рік серед стандартних періодів оплати.
 Кредити й ліміти живуть у [goloop/ledger](https://github.com/goloop/ledger).
 Довідник показує кожну модель у коді: [Моделі продажу](DOC.UK.md#моделі-продажу).
 
@@ -86,33 +91,71 @@ co, err := c.CreateCheckout(ctx, &creem.CheckoutRequest{
 wh := creem.NewWebhook(os.Getenv("CREEM_WEBHOOK_SECRET"))
 
 http.HandleFunc("POST /webhooks/creem", func(w http.ResponseWriter, r *http.Request) {
-	ev, err := wh.ParseRequest(r)
+	ev, err := wh.ParseRequest(r) // також відхиляє подію, старішу за DefaultMaxAge
 	if err != nil {
 		http.Error(w, "bad signature", http.StatusBadRequest)
 		return
 	}
-	// Підпис без часу: збережений id події - захист від відтворення.
-	if seen, _ := events.Seen(r.Context(), ev.ID); seen { // ваша таблиця
+	ctx := r.Context()
+	// // Таблиця подій - скорочення, а не захист: apply ідемпотентний сам
+	// (записи з ключами), а подію позначено виконаною лише після застосування,
+	// тож невдачу тут Creem повторить, і вона не загубиться.
+	done, err := events.Done(ctx, ev.ID) // ваша таблиця
+	if err != nil {
+		http.Error(w, "retry", http.StatusInternalServerError)
+		return
+	}
+	if done {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
-	switch ev.Type {
-	case creem.EventCheckoutCompleted:
-		co, _ := ev.Checkout()
-		err = purchases.Paid(r.Context(), co.RequestID, co.Order.Amount, co.Order.Currency)
-	case creem.EventSubscriptionPaid, creem.EventSubscriptionCanceled, creem.EventSubscriptionExpired:
-		sub, _ := ev.Subscription()
-		err = entitlements.Sync(r.Context(), sub)
-	case creem.EventRefundCreated:
-		ref, _ := ev.Refund()
-		err = purchases.Refunded(r.Context(), ref.Checkout.ID, ref.ID)
+	if err := apply(ctx, ev); err != nil {
+		http.Error(w, "retry", http.StatusInternalServerError) // Creem надішле ще раз
+		return
 	}
-	if err != nil {
+	if err := events.MarkDone(ctx, ev.ID); err != nil {
 		http.Error(w, "retry", http.StatusInternalServerError)
 		return
 	}
 	w.WriteHeader(http.StatusOK)
 })
+
+func apply(ctx context.Context, ev *creem.Event) error {
+	switch ev.Type {
+	case creem.EventCheckoutCompleted:
+		co, err := ev.Checkout()
+		if err != nil {
+			return err
+		}
+		if co.Order == nil {
+			return fmt.Errorf("checkout %s completed without an order", co.ID)
+		}
+		// // Звірити суму й валюту з покупкою, потім нарахувати з ключем - id транзакції.
+		return purchases.Paid(ctx, co.RequestID, co.Order.Transaction, co.Order.AmountPaid, co.Order.Currency)
+
+	case creem.EventSubscriptionPaid, creem.EventSubscriptionCanceled, creem.EventSubscriptionExpired:
+		sub, err := ev.Subscription()
+		if err != nil {
+			return err
+		}
+		return entitlements.Sync(ctx, sub, ev.CreatedAt.Time) // ігнорує подію, старішу за стан
+
+	case creem.EventRefundCreated:
+		ref, err := ev.Refund()
+		if err != nil {
+			return err
+		}
+		return purchases.Refunded(ctx, ref.Transaction.ID, ref.ID, ref.RefundAmount) // // може бути частковим (повернення з дашборду): забрати пропорційно, ключ ref.ID
+
+	case creem.EventDisputeCreated:
+		d, err := ev.Dispute()
+		if err != nil {
+			return err
+		}
+		return purchases.Refunded(ctx, d.Transaction.ID, d.ID, d.Amount)
+	}
+	return nil
+}
 ```
 
 ## API коротко
@@ -124,7 +167,7 @@ http.HandleFunc("POST /webhooks/creem", func(w http.ResponseWriter, r *http.Requ
 | `UpgradeSubscription`, `UpdateSubscriptionItems` | `/v1/subscriptions/{id}[/upgrade]` |
 | `RefundTransaction` | `/v1/refunds` |
 | `GetCustomer`, `CustomerByEmail`, `CustomerPortalLink` | `/v1/customers[/billing]` |
-| `GetTransaction` | `/v1/transactions` |
+| `GetTransaction`, `ListTransactions` | `/v1/transactions[/search]` |
 | `NewWebhook`, `Webhook.ParseRequest`, `Sign` | події вебхуків |
 
 ## Документація

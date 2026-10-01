@@ -8,8 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 )
 
 // DefaultMaxBody bounds the webhook body ParseRequest reads.
@@ -18,9 +20,23 @@ const DefaultMaxBody = 1 << 20
 // SignatureHeader is the header that carries the webhook signature.
 const SignatureHeader = "creem-signature"
 
-// ErrSignature reports a webhook whose signature is missing or does not
-// match the body.
-var ErrSignature = errors.New("creem: bad webhook signature")
+// DefaultMaxAge is how old an event Parse accepts. Creem stops retrying a
+// delivery after 24 hours; twice that leaves room for a late retry and a
+// drifting clock, and still bounds how long a captured delivery can be
+// replayed.
+const DefaultMaxAge = 48 * time.Hour
+
+var (
+	// ErrSignature reports a webhook whose signature is missing or does not
+	// match the body.
+	ErrSignature = errors.New("creem: bad webhook signature")
+
+	// ErrEventExpired reports a correctly signed event whose created_at is
+	// further from the local clock than the allowed age: a replay of a
+	// captured delivery, or a clock that drifted. It matches ErrSignature
+	// too, so one check rejects both.
+	ErrEventExpired = fmt.Errorf("%w: event outside the allowed age", ErrSignature)
+)
 
 // Event types this package names. Any other type still parses; compare
 // Event.Type with the string.
@@ -45,8 +61,9 @@ const (
 // Event is one verified webhook notification.
 type Event struct {
 	// ID identifies the event. Deduplicate on it: a delivery can arrive
-	// more than once, and the signature carries no timestamp, so the id is
-	// also the only defence against a replayed delivery.
+	// more than once. The signature carries no timestamp, so the id - with
+	// the age check on CreatedAt - is also the defence against a replayed
+	// delivery.
 	ID        string `json:"id"`
 	Type      string `json:"eventType"`
 	CreatedAt Time   `json:"created_at"`
@@ -93,6 +110,8 @@ func (e *Event) Dispute() (*Dispute, error) {
 type Webhook struct {
 	secrets [][]byte
 	maxBody int64
+	maxAge  time.Duration
+	now     func() time.Time
 }
 
 // WebhookOption configures a Webhook in NewWebhook.
@@ -114,11 +133,23 @@ func WithMaxBody(n int64) WebhookOption {
 	return func(w *Webhook) { w.maxBody = n }
 }
 
+// WithMaxAge sets how far an event's created_at may be from the local clock,
+// either way. The default is DefaultMaxAge; zero turns the check off and
+// leaves the stored event ids as the only replay guard.
+func WithMaxAge(d time.Duration) WebhookOption {
+	return func(w *Webhook) { w.maxAge = max(0, d) }
+}
+
+// WithWebhookClock replaces time.Now, for tests.
+func WithWebhookClock(now func() time.Time) WebhookOption {
+	return func(w *Webhook) { w.now = now }
+}
+
 // NewWebhook returns a Webhook for the webhook secret. An empty secret
 // verifies nothing: every delivery fails with ErrSignature, which is the safe
 // way for a misconfigured service to fail.
 func NewWebhook(secret string, opts ...WebhookOption) *Webhook {
-	w := &Webhook{maxBody: DefaultMaxBody}
+	w := &Webhook{maxBody: DefaultMaxBody, maxAge: DefaultMaxAge, now: time.Now}
 	if secret != "" {
 		w.secrets = append(w.secrets, []byte(secret))
 	}
@@ -128,8 +159,20 @@ func NewWebhook(secret string, opts ...WebhookOption) *Webhook {
 	return w
 }
 
+// String describes the webhook without its secrets.
+func (w *Webhook) String() string {
+	return fmt.Sprintf("creem.Webhook(%d secrets, max age %s)", len(w.secrets), w.maxAge)
+}
+
+// GoString is String, for %#v.
+func (w *Webhook) GoString() string { return w.String() }
+
+// LogValue implements slog.LogValuer, without the secrets.
+func (w *Webhook) LogValue() slog.Value { return slog.StringValue(w.String()) }
+
 // Verify checks a signature against the raw body: the hex HMAC-SHA256 of the
-// body under the secret. The body must be the bytes as received.
+// body under the secret. The body must be the bytes as received. It checks
+// the signature only; Parse also checks the event's age.
 func (w *Webhook) Verify(signature string, body []byte) error {
 	got, err := hex.DecodeString(strings.TrimSpace(signature))
 	if err != nil || len(got) == 0 || len(w.secrets) == 0 {
@@ -145,7 +188,9 @@ func (w *Webhook) Verify(signature string, body []byte) error {
 	return ErrSignature
 }
 
-// Parse verifies a delivery and decodes it.
+// Parse verifies a delivery, decodes it and checks its age: created_at is in
+// the signed body, so it cannot be forged, and an event older than the
+// allowed age fails with ErrEventExpired.
 func (w *Webhook) Parse(signature string, body []byte) (*Event, error) {
 	if err := w.Verify(signature, body); err != nil {
 		return nil, err
@@ -156,6 +201,15 @@ func (w *Webhook) Parse(signature string, body []byte) (*Event, error) {
 	}
 	if e.ID == "" || e.Type == "" {
 		return nil, errors.New("creem: decode event: no id or eventType")
+	}
+	if w.maxAge > 0 {
+		if e.CreatedAt.IsZero() {
+			return nil, fmt.Errorf("%w: no created_at", ErrEventExpired)
+		}
+		age := w.now().Sub(e.CreatedAt.Time)
+		if age > w.maxAge || age < -w.maxAge {
+			return nil, ErrEventExpired
+		}
 	}
 	return &e, nil
 }

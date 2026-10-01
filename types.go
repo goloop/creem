@@ -11,10 +11,15 @@ import (
 // Time is a timestamp as Creem sends it: an ISO 8601 string on most
 // entities, milliseconds since the epoch on transactions and webhook
 // envelopes. Both decode into the embedded time.Time; null and absent are
-// the zero time.
+// the zero time. A number below 10^11 is read as seconds instead: as
+// milliseconds it would be a date in 1973, which no Creem entity has.
 type Time struct {
 	time.Time
 }
+
+// secondsBelow separates seconds from milliseconds since the epoch: 10^11
+// seconds is the year 5138, 10^11 milliseconds is March 1973.
+const secondsBelow = 100_000_000_000
 
 // UnmarshalJSON implements json.Unmarshaler.
 func (t *Time) UnmarshalJSON(b []byte) error {
@@ -46,6 +51,10 @@ func (t *Time) UnmarshalJSON(b []byte) error {
 				return fmt.Errorf("creem: time %s: %w", b, err)
 			}
 			ms = int64(f)
+		}
+		if ms > -secondsBelow && ms < secondsBelow {
+			t.Time = time.Unix(ms, 0).UTC()
+			return nil
 		}
 		t.Time = time.UnixMilli(ms).UTC()
 		return nil

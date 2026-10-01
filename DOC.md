@@ -16,6 +16,7 @@ Ukrainian version: **[DOC.UK.md](DOC.UK.md)**.
 - [Customers, portal, transactions](#customers-portal-transactions)
 - [Selling models](#selling-models)
 - [Webhooks](#webhooks)
+- [Reconciliation](#reconciliation)
 - [Shapes: Time and Expandable](#shapes-time-and-expandable)
 - [Retries](#retries)
 - [Errors](#errors)
@@ -45,9 +46,23 @@ the client talks. The key is sent as `x-api-key`.
 | Option | Default |
 |---|---|
 | `WithTimeout` | 30s (default HTTP client only) |
-| `WithHTTPClient` | a new `http.Client` |
-| `WithMaxRetries` | 2 |
+| `WithHTTPClient` | a new `http.Client`; nil keeps it |
+| `WithMaxRetries` | 2, at most `MaxRetries` (10) |
 | `WithHeader` | none |
+
+What the client refuses, whatever the options:
+
+- **Redirects.** The API has no reason to send one, and `x-api-key` is not a
+  header `net/http` drops on the way to another host: following a redirect
+  would hand the key over. A 3xx comes back as an `*APIError`. A client
+  passed to `WithHTTPClient` is copied for this, never changed.
+- **Plain HTTP**, except to a loopback host (a test server), and an empty
+  key. Both fail with `ErrInvalid` before anything is sent.
+- **An id that could change the path.** Ids may hold letters, digits, `_`
+  and `-`, at most 128 bytes; anything else fails with `ErrInvalid`.
+
+The key never appears in output: `String`, `GoString` and `LogValue` show
+the host only. A `Webhook` hides its secrets the same way.
 
 ## Checkouts
 
@@ -98,8 +113,10 @@ status, err := c.RefundTransaction(ctx, "tran_...")
 ```
 
 The API refunds what is left of a transaction, in full; there is no partial
-refund. The `refund.created` webhook follows. A chargeback arrives as
-`dispute.created`; treat it like a refund.
+refund through the API. The `refund.created` webhook follows. A refund made
+in the Creem dashboard can be partial, so take back in proportion to
+`Refund.RefundAmount`, not the whole purchase. A chargeback arrives as
+`dispute.created`; treat it like a refund, for `Dispute.Amount`.
 
 ## Customers, portal, transactions
 
@@ -110,7 +127,13 @@ cu, err = c.CustomerByEmail(ctx, "ann@example.com")
 link, err := c.CustomerPortalLink(ctx, cu.ID) // where the customer manages billing
 
 tr, err := c.GetTransaction(ctx, "tran_...")
+page, err := c.ListTransactions(ctx, &creem.ListTransactionsRequest{CustomerID: cu.ID})
 ```
+
+`CustomerByEmail` and `CustomerPortalLink` belong behind an address the user
+has proved they own and a customer id your database ties to the signed-in
+account: the portal shows the orders and subscriptions of whoever bought
+with that address.
 
 ## Selling models
 
@@ -221,8 +244,9 @@ status, err := c.RefundTransaction(ctx, transactionID) // full refund only
 ```
 
 `refund.created` follows; take back what the money bought, keyed by the
-refund id. A chargeback arrives as `dispute.created`. A partial refund is
-not available through the API.
+refund id, in proportion to `RefundAmount` (a dashboard refund can be
+partial). A chargeback arrives as `dispute.created`, keyed by the dispute id.
+A partial refund is not available through the API.
 
 ### What Creem does not do
 
@@ -231,8 +255,6 @@ not available through the API.
 - invoices with payment terms for companies;
 - a balance of credits or metered usage - sell packs as one-time purchases
   and keep the balance in [goloop/ledger](https://github.com/goloop/ledger).
-
-For the first three, Paddle is the fallback; `goloop/paddle` covers them.
 
 ## Webhooks
 
@@ -248,15 +270,24 @@ Verification:
 - `WithPreviousSecret` accepts an older secret during a rotation.
 - An empty secret verifies nothing, so a misconfigured service rejects every
   delivery instead of accepting forgeries.
-- **The signature carries no timestamp.** A captured delivery verifies
-  forever, so deduplicating on `ev.ID` is not only how a repeated delivery is
-  ignored - it is the only defence against a replayed one. Store every event
-  id you processed.
+- **The signature carries no timestamp**, so a captured delivery would verify
+  forever. `created_at` is in the signed body, though, and `Parse` refuses an
+  event further than `DefaultMaxAge` (48 hours) from the local clock with
+  `ErrEventExpired`, which matches `ErrSignature`. Creem stops retrying a
+  delivery within a day, so a genuine one is never that old. `WithMaxAge`
+  changes the window; zero turns it off. An event without `created_at` is
+  refused while the check is on.
+- **Store every event id you processed** and skip one you have seen: within
+  the window, the id is what stops a replay.
 
 Handling:
 
-- Answer 200 once the event is stored; Creem retries a failed delivery a few
-  times over the following hours.
+- Answer 200 once the event is applied. Creem retries a failed delivery after
+  30 seconds, 5 minutes, 30 minutes and 6 hours, and not after 24 hours.
+- Mark an event done only after it was applied: marking it first loses it
+  when applying fails. After the last retry, see
+  [Reconciliation](#reconciliation).
+- In `checkout.completed`, `co.Order` can be missing; check it before use.
 - `ev.CreatedAt` is when the event was made; use it, or the entity's
   `UpdatedAt`, to ignore an event older than the state already applied.
 
@@ -269,11 +300,44 @@ and `co.Subscription` the subscription it started, if any.
 
 `Sign(secret, body)` builds a valid signature, for tests of your handler.
 
+## Reconciliation
+
+A webhook can be lost for good: a bug, an outage longer than a day, a secret
+rotated wrong. A payment whose webhook never arrived is a customer who paid
+and got nothing. A periodic job walks the transactions and applies each paid
+one the way the webhook would:
+
+```go
+req := &creem.ListTransactionsRequest{Page: 1, PageSize: 50}
+for {
+	page, err := c.ListTransactions(ctx, req)
+	if err != nil {
+		return err
+	}
+	for _, tr := range page.Items {
+		if tr.Status == creem.TransactionPaid {
+			if err := purchases.PaidTransaction(ctx, &tr); err != nil { // the webhook's own code
+				return err
+			}
+		}
+	}
+	if page.NextPage == 0 {
+		break
+	}
+	req.Page = page.NextPage
+}
+```
+
+The ledger's keys - the provider's ids - make a transaction the webhook
+already applied a no-op here. Filter by `CustomerID`, `ProductID` or
+`OrderID` to keep the walk short.
+
 ## Shapes: Time and Expandable
 
 Creem sends timestamps as ISO strings on most entities and as milliseconds
 since the epoch on transactions and webhook envelopes. `Time` embeds
-`time.Time` and reads both; `null` and absent are the zero time.
+`time.Time` and reads both; `null` and absent are the zero time. A number
+below 10^11 is read as seconds: as milliseconds it would be a date in 1973.
 
 A reference to another entity is sometimes an id and sometimes the expanded
 entity. `Expandable[T]` reads both:
@@ -294,7 +358,9 @@ co.Customer.Object // *Customer when it was expanded, nil otherwise
 
 A POST that failed with a 5xx may have been applied - a refund, a
 cancellation - so repeating it is left to the caller, who can read the state
-back first.
+back first. The backoff is 0.5s, 1s, 2s ... with jitter, at most 8s;
+`Retry-After` is capped at 60 seconds. A request that cannot be built fails
+at once.
 
 ## Errors
 
@@ -307,7 +373,9 @@ if errors.Is(err, creem.ErrNotFound) { ... } // any 404
 ```
 
 `Messages` is a list; Creem sometimes sends a single string, which becomes a
-list of one. `ErrInvalid` reports a request refused before it was sent.
+list of one. `ErrInvalid` reports a request refused before it was sent: a
+missing field, an id outside the allowlist, an empty key, a base URL over
+plain HTTP.
 
 ## Scope
 

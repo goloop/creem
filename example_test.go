@@ -3,6 +3,7 @@ package creem_test
 import (
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/goloop/creem"
 )
@@ -53,7 +54,8 @@ func ExampleWebhook() {
 }
 
 func ExampleSign() {
-	body := []byte(`{"id":"evt_1","eventType":"checkout.completed","object":{}}`)
+	body := fmt.Appendf(nil, `{"id":"evt_1","eventType":"checkout.completed","created_at":%d,"object":{}}`,
+		time.Now().UnixMilli())
 	ev, err := creem.NewWebhook("secret").Parse(creem.Sign("secret", body), body)
 	fmt.Println(ev.ID, err)
 	// Output: evt_1 <nil>

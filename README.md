@@ -1,4 +1,4 @@
-[![Go Reference](https://img.shields.io/badge/godoc-reference-blue)](https://pkg.go.dev/github.com/goloop/creem) [![License](https://img.shields.io/badge/license-MIT-brightgreen)](https://github.com/goloop/creem/blob/master/LICENSE) [![Stay with Ukraine](https://img.shields.io/static/v1?label=Stay%20with&message=Ukraine%20♥&color=ffD700&labelColor=0057B8&style=flat)](https://u24.gov.ua/)
+[![deps.dev](https://img.shields.io/badge/deps.dev-insights-4c8dbc)](https://deps.dev/go/github.com%2Fgoloop%2Fcreem) [![Go Reference](https://img.shields.io/badge/godoc-reference-blue)](https://pkg.go.dev/github.com/goloop/creem) [![License](https://img.shields.io/badge/license-MIT-brightgreen)](https://github.com/goloop/creem/blob/master/LICENSE) [![Stay with Ukraine](https://img.shields.io/static/v1?label=Stay%20with&message=Ukraine%20♥&color=ffD700&labelColor=0057B8&style=flat)](https://u24.gov.ua/)
 
 # creem
 
@@ -17,15 +17,18 @@ plus two of Creem's own:
 
 - **The amount must come from the server.** Checkouts are created here, and
   a custom price for a credit pack is validated before it is sent.
-- **The webhook signature has no timestamp.** A captured delivery verifies
-  forever, so the event id must be stored and checked - the package makes
-  that explicit and refuses events without an id.
+- **The webhook signature has no timestamp.** A captured delivery would
+  verify forever. The package checks the event's `created_at` - which is in
+  the signed body - and refuses an event older than two days, and the event
+  id must still be stored and checked.
 - **Shapes vary.** Timestamps arrive as ISO strings on some entities and as
   milliseconds on others; references arrive as ids or as expanded objects.
   `Time` and `Expandable` read both, so a handler does not break on the day
   a field changes form.
 - **A failed POST may have succeeded.** A refund or cancellation is not
   retried after a 5xx; only what cannot have run is.
+- **A lost webhook is lost money.** Creem stops retrying after a day;
+  `ListTransactions` lets a periodic job find what never arrived.
 
 ## Features
 
@@ -34,10 +37,11 @@ plus two of Creem's own:
 - Subscriptions: get, cancel (at once or at the period end), pause, resume,
   upgrade to another product, change the number of seats.
 - Full refunds; customers by id or email; billing portal links;
-  transactions.
-- Webhooks: HMAC-SHA256 signature check with secret rotation; typed
-  checkouts, subscriptions, refunds and disputes.
-- Typed `*APIError`; the host follows the key (test or live).
+  transactions, one by one or paged for reconciliation.
+- Webhooks: HMAC-SHA256 signature check with secret rotation and an age
+  check; typed checkouts, subscriptions, refunds and disputes.
+- Typed `*APIError`; the host follows the key (test or live); no redirects
+  followed, ids checked against an allowlist, keys never printed.
 - Zero dependencies.
 
 ## Installation
@@ -77,7 +81,7 @@ co, err := c.CreateCheckout(ctx, &creem.CheckoutRequest{
 Not available through Creem: a recurring amount decided on the server
 (`CustomPrice` is for one-time products only), partial refunds, invoices
 with payment terms, and terms longer than a year among the standard billing
-periods - use Paddle for those. Credits and allowances live in
+periods. Credits and allowances live in
 [goloop/ledger](https://github.com/goloop/ledger). The reference shows every
 model in code: [Selling models](DOC.md#selling-models).
 
@@ -87,33 +91,71 @@ model in code: [Selling models](DOC.md#selling-models).
 wh := creem.NewWebhook(os.Getenv("CREEM_WEBHOOK_SECRET"))
 
 http.HandleFunc("POST /webhooks/creem", func(w http.ResponseWriter, r *http.Request) {
-	ev, err := wh.ParseRequest(r)
+	ev, err := wh.ParseRequest(r) // also refuses an event older than DefaultMaxAge
 	if err != nil {
 		http.Error(w, "bad signature", http.StatusBadRequest)
 		return
 	}
-	// No timestamp in the signature: the stored event id is the replay guard.
-	if seen, _ := events.Seen(r.Context(), ev.ID); seen { // your table
+	ctx := r.Context()
+	// // The event table is a shortcut, not the guard: apply is idempotent on
+	// its own (keyed writes), and an event is marked done only after it was
+	// applied, so a failure here is retried by Creem and never lost.
+	done, err := events.Done(ctx, ev.ID) // your table
+	if err != nil {
+		http.Error(w, "retry", http.StatusInternalServerError)
+		return
+	}
+	if done {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
-	switch ev.Type {
-	case creem.EventCheckoutCompleted:
-		co, _ := ev.Checkout()
-		err = purchases.Paid(r.Context(), co.RequestID, co.Order.Amount, co.Order.Currency)
-	case creem.EventSubscriptionPaid, creem.EventSubscriptionCanceled, creem.EventSubscriptionExpired:
-		sub, _ := ev.Subscription()
-		err = entitlements.Sync(r.Context(), sub)
-	case creem.EventRefundCreated:
-		ref, _ := ev.Refund()
-		err = purchases.Refunded(r.Context(), ref.Checkout.ID, ref.ID)
+	if err := apply(ctx, ev); err != nil {
+		http.Error(w, "retry", http.StatusInternalServerError) // Creem sends it again
+		return
 	}
-	if err != nil {
+	if err := events.MarkDone(ctx, ev.ID); err != nil {
 		http.Error(w, "retry", http.StatusInternalServerError)
 		return
 	}
 	w.WriteHeader(http.StatusOK)
 })
+
+func apply(ctx context.Context, ev *creem.Event) error {
+	switch ev.Type {
+	case creem.EventCheckoutCompleted:
+		co, err := ev.Checkout()
+		if err != nil {
+			return err
+		}
+		if co.Order == nil {
+			return fmt.Errorf("checkout %s completed without an order", co.ID)
+		}
+		// // Compare the amount and currency with the purchase, then credit, keyed by the transaction id.
+		return purchases.Paid(ctx, co.RequestID, co.Order.Transaction, co.Order.AmountPaid, co.Order.Currency)
+
+	case creem.EventSubscriptionPaid, creem.EventSubscriptionCanceled, creem.EventSubscriptionExpired:
+		sub, err := ev.Subscription()
+		if err != nil {
+			return err
+		}
+		return entitlements.Sync(ctx, sub, ev.CreatedAt.Time) // ignores an event older than the state
+
+	case creem.EventRefundCreated:
+		ref, err := ev.Refund()
+		if err != nil {
+			return err
+		}
+		return purchases.Refunded(ctx, ref.Transaction.ID, ref.ID, ref.RefundAmount) // // may be partial (refunded from the dashboard): take back in proportion, keyed by ref.ID
+
+	case creem.EventDisputeCreated:
+		d, err := ev.Dispute()
+		if err != nil {
+			return err
+		}
+		return purchases.Refunded(ctx, d.Transaction.ID, d.ID, d.Amount)
+	}
+	return nil
+}
 ```
 
 ## The API at a glance
@@ -125,7 +167,7 @@ http.HandleFunc("POST /webhooks/creem", func(w http.ResponseWriter, r *http.Requ
 | `UpgradeSubscription`, `UpdateSubscriptionItems` | `/v1/subscriptions/{id}[/upgrade]` |
 | `RefundTransaction` | `/v1/refunds` |
 | `GetCustomer`, `CustomerByEmail`, `CustomerPortalLink` | `/v1/customers[/billing]` |
-| `GetTransaction` | `/v1/transactions` |
+| `GetTransaction`, `ListTransactions` | `/v1/transactions[/search]` |
 | `NewWebhook`, `Webhook.ParseRequest`, `Sign` | webhook events |
 
 ## Documentation
