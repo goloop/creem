@@ -288,6 +288,10 @@ Handling:
   when applying fails. After the last retry, see
   [Reconciliation](#reconciliation).
 - In `checkout.completed`, `co.Order` can be missing; check it before use.
+- Check `Mode` on the entity against your environment: a test event that
+  reaches a live handler is refused, not credited.
+- `RefundTransaction` returning `RefundPending` or `RefundRequiresAction` is
+  not a refund yet: the money moves when `refund.created` says so.
 - `ev.CreatedAt` is when the event was made; use it, or the entity's
   `UpdatedAt`, to ignore an event older than the state already applied.
 
@@ -330,7 +334,13 @@ for {
 
 The ledger's keys - the provider's ids - make a transaction the webhook
 already applied a no-op here. Filter by `CustomerID`, `ProductID` or
-`OrderID` to keep the walk short.
+`OrderID` to keep the walk short. A page whose next page does not move
+forward, or with an item without an id, is `ErrResponse`, not the end. Pages
+are numbered, so new transactions arriving during the walk can shift items
+between pages: overlap the walks, and save the checkpoint only after a walk
+that reached the last page. Refunded and charged-back transactions
+(`TransactionRefunded`, `TransactionPartialRefund`, `TransactionChargedBack`)
+belong to the walk too.
 
 ## Shapes: Time and Expandable
 
@@ -359,8 +369,9 @@ co.Customer.Object // *Customer when it was expanded, nil otherwise
 A POST that failed with a 5xx may have been applied - a refund, a
 cancellation - so repeating it is left to the caller, who can read the state
 back first. The backoff is 0.5s, 1s, 2s ... with jitter, at most 8s;
-`Retry-After` is capped at 60 seconds. A request that cannot be built fails
-at once.
+`Retry-After`, in seconds or as an HTTP date, is capped at 60 seconds,
+before the conversion, so a huge value cannot overflow. A request that
+cannot be built fails at once.
 
 ## Errors
 
@@ -376,6 +387,15 @@ if errors.Is(err, creem.ErrNotFound) { ... } // any 404
 list of one. `ErrInvalid` reports a request refused before it was sent: a
 missing field, an id outside the allowlist, an empty key, a base URL over
 plain HTTP.
+
+`ErrResponse` reports a successful answer that does not hold what the call
+expects: an empty body, an entity without an id or with another id than asked
+for, a refund status it does not know, a
+page number that does not move forward. It comes from a broken proxy, a
+test double or a change in the API, and is never a result to act on.
+
+`APIError.Raw` holds the response body as received. Log the status, the code
+and the request id, not `Raw`: a body can carry customer data.
 
 ## Scope
 

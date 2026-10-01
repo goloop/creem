@@ -101,7 +101,7 @@ func TestOptionsAndUnsafeConfig(t *testing.T) {
 		t.Fatalf("a malformed base URL must be refused, got %v", err)
 	}
 
-	s, c := newServer(t, ok(`{}`))
+	s, c := newServer(t, ok(`{"id":"cust_1"}`))
 	c.headers.Set("X-Trace", "t2")
 	if _, err := c.GetCustomer(ctx, "cust_1"); err != nil || s.got[0].Header.Get("X-Trace") != "t2" ||
 		s.got[0].Header.Get("x-api-key") == "" {
@@ -277,5 +277,91 @@ func TestDecodeErrorNamesType(t *testing.T) {
 	}
 	if _, err := NewWebhook("s").Parse(Sign("s", []byte("{")), []byte("{")); err == nil || errors.Is(err, ErrSignature) {
 		t.Fatalf("a signed body that is not JSON is a decode error, got %v", err)
+	}
+}
+
+func TestEmptyOrForeignEntityIsAnError(t *testing.T) {
+	for name, body := range map[string]string{
+		"null":         `null`,
+		"empty object": `{}`,
+		"other id":     `{"id":"tran_other","amount":1500}`,
+		"no body":      ``,
+	} {
+		_, c := newServer(t, ok(body))
+		if tr, err := c.GetTransaction(ctx, "tran_1"); !errors.Is(err, ErrResponse) || tr != nil {
+			t.Errorf("%s: a successful response without the transaction asked for is ErrResponse, got %+v, %v", name, tr, err)
+		}
+	}
+	_, c := newServer(t, ok(`{"id":"ch_1","status":"pending"}`))
+	if _, err := c.CreateCheckout(ctx, &CheckoutRequest{ProductID: "prod_1"}); !errors.Is(err, ErrResponse) {
+		t.Fatalf("a checkout without a URL to send the customer to is ErrResponse, got %v", err)
+	}
+	_, c = newServer(t, ok(`{"customer_portal_link":""}`))
+	if _, err := c.CustomerPortalLink(ctx, "cust_1"); !errors.Is(err, ErrResponse) {
+		t.Fatalf("got %v", err)
+	}
+	_, c = newServer(t, ok(`{"status":"done"}`))
+	if _, err := c.RefundTransaction(ctx, "tran_1"); !errors.Is(err, ErrResponse) {
+		t.Fatalf("an unknown refund status is ErrResponse, got %v", err)
+	}
+	_, c = newServer(t, ok(`{"status":"pending"}`))
+	if st, err := c.RefundTransaction(ctx, "tran_1"); err != nil || st != RefundPending {
+		t.Fatalf("got %q, %v", st, err)
+	}
+}
+
+func TestCustomerByEmailComparesTheAnswer(t *testing.T) {
+	_, c := newServer(t, ok(`{"id":"cust_9","email":"someone-else@example.com"}`))
+	if _, err := c.CustomerByEmail(ctx, "ann@example.com"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("a customer with another address must never be returned, got %v", err)
+	}
+	_, c = newServer(t, ok(`{"id":"cust_1","email":"Ann@Example.com"}`))
+	if cu, err := c.CustomerByEmail(ctx, "ann@example.com"); err != nil || cu.ID != "cust_1" {
+		t.Fatalf("got %+v, %v", cu, err)
+	}
+}
+
+func TestPagesMustMoveForward(t *testing.T) {
+	for name, body := range map[string]string{
+		"same page":  `{"items":[{"id":"tran_1"}],"pagination":{"next_page":2}}`,
+		"back":       `{"items":[{"id":"tran_1"}],"pagination":{"next_page":1}}`,
+		"negative":   `{"items":[{"id":"tran_1"}],"pagination":{"next_page":-1}}`,
+		"item no id": `{"items":[{"amount":5}],"pagination":{"next_page":null}}`,
+	} {
+		_, c := newServer(t, ok(body))
+		if _, err := c.ListTransactions(ctx, &ListTransactionsRequest{Page: 2}); !errors.Is(err, ErrResponse) {
+			t.Errorf("%s: want ErrResponse, got %v", name, err)
+		}
+	}
+}
+
+func TestRetryAfterIsBounded(t *testing.T) {
+	cases := map[string]time.Duration{
+		"9223372037":           maxRetryAfter,
+		"99999999999999999999": 0, // not an int64: falls back
+		"30":                   30 * time.Second,
+		"0":                    0,
+		"soon":                 0,
+		time.Now().Add(20 * time.Second).UTC().Format(http.TimeFormat): 20 * time.Second,
+		time.Now().Add(-time.Hour).UTC().Format(http.TimeFormat):       0,
+		time.Now().Add(time.Hour).UTC().Format(http.TimeFormat):        maxRetryAfter,
+	}
+	for in, want := range cases {
+		got := retryAfter(in)
+		if got < 0 || got > maxRetryAfter || (want != 20*time.Second && got != want) || (want == 20*time.Second && (got < 18*time.Second || got > 20*time.Second)) {
+			t.Errorf("retryAfter(%q) = %v, want %v", in, got, want)
+		}
+	}
+}
+
+func TestTimeRefusesFractions(t *testing.T) {
+	var v Time
+	for _, in := range []string{`1.5`, `1e300`, `NaN`, `1893553445678.25`} {
+		if err := json.Unmarshal([]byte(in), &v); err == nil {
+			t.Errorf("%s must not decode as a time", in)
+		}
+	}
+	if err := json.Unmarshal([]byte(`1.893553445678e12`), &v); err != nil || v.Year() != 2030 {
+		t.Fatalf("a whole number written as a float is accepted, got %v, %v", v.Time, err)
 	}
 }

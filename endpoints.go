@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 )
 
 // Custom price limits, in cents per unit.
@@ -68,6 +69,12 @@ func (c *Client) CreateCheckout(ctx context.Context, req *CheckoutRequest) (*Che
 	if err := c.do(ctx, http.MethodPost, "/v1/checkouts", nil, req, &out); err != nil {
 		return nil, err
 	}
+	if err := expectID("checkout", out.ID, ""); err != nil {
+		return nil, err
+	}
+	if out.CheckoutURL == "" {
+		return nil, fmt.Errorf("%w: checkout %q without a checkout URL", ErrResponse, out.ID)
+	}
 	return &out, nil
 }
 
@@ -80,6 +87,9 @@ func (c *Client) GetCheckout(ctx context.Context, id string) (*Checkout, error) 
 	if err := c.do(ctx, http.MethodGet, "/v1/checkouts", url.Values{"checkout_id": {id}}, nil, &out); err != nil {
 		return nil, err
 	}
+	if err := expectID("checkout", out.ID, id); err != nil {
+		return nil, err
+	}
 	return &out, nil
 }
 
@@ -90,6 +100,9 @@ func (c *Client) GetSubscription(ctx context.Context, id string) (*Subscription,
 	}
 	var out Subscription
 	if err := c.do(ctx, http.MethodGet, "/v1/subscriptions", url.Values{"subscription_id": {id}}, nil, &out); err != nil {
+		return nil, err
+	}
+	if err := expectID("subscription", out.ID, id); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -125,6 +138,9 @@ func (c *Client) CancelSubscription(ctx context.Context, id string, req *CancelR
 	if err := c.do(ctx, http.MethodPost, "/v1/subscriptions/"+id+"/cancel", nil, req, &out); err != nil {
 		return nil, err
 	}
+	if err := expectID("subscription", out.ID, id); err != nil {
+		return nil, err
+	}
 	return &out, nil
 }
 
@@ -135,6 +151,9 @@ func (c *Client) PauseSubscription(ctx context.Context, id string) (*Subscriptio
 	}
 	var out Subscription
 	if err := c.do(ctx, http.MethodPost, "/v1/subscriptions/"+id+"/pause", nil, struct{}{}, &out); err != nil {
+		return nil, err
+	}
+	if err := expectID("subscription", out.ID, id); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -148,6 +167,9 @@ func (c *Client) ResumeSubscription(ctx context.Context, id string) (*Subscripti
 	}
 	var out Subscription
 	if err := c.do(ctx, http.MethodPost, "/v1/subscriptions/"+id+"/resume", nil, struct{}{}, &out); err != nil {
+		return nil, err
+	}
+	if err := expectID("subscription", out.ID, id); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -176,6 +198,9 @@ func (c *Client) UpgradeSubscription(ctx context.Context, id, productID, updateB
 	}
 	var out Subscription
 	if err := c.do(ctx, http.MethodPost, "/v1/subscriptions/"+id+"/upgrade", nil, body, &out); err != nil {
+		return nil, err
+	}
+	if err := expectID("subscription", out.ID, id); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -216,6 +241,9 @@ func (c *Client) UpdateSubscriptionItems(ctx context.Context, id string, items [
 	if err := c.do(ctx, http.MethodPost, "/v1/subscriptions/"+id, nil, body, &out); err != nil {
 		return nil, err
 	}
+	if err := expectID("subscription", out.ID, id); err != nil {
+		return nil, err
+	}
 	return &out, nil
 }
 
@@ -228,10 +256,19 @@ func (c *Client) GetCustomer(ctx context.Context, id string) (*Customer, error) 
 	if err := c.do(ctx, http.MethodGet, "/v1/customers", url.Values{"customer_id": {id}}, nil, &out); err != nil {
 		return nil, err
 	}
+	if err := expectID("customer", out.ID, id); err != nil {
+		return nil, err
+	}
 	return &out, nil
 }
 
-// CustomerByEmail returns the customer with the address.
+// CustomerByEmail returns the customer with the address, or ErrNotFound. The
+// address is compared in the answer as well as in the query: a customer with
+// another address is never returned.
+//
+// Call it only with an address the user has proved they own: the customer
+// opens a billing portal with the orders and subscriptions of whoever bought
+// with that address.
 func (c *Client) CustomerByEmail(ctx context.Context, email string) (*Customer, error) {
 	if email == "" {
 		return nil, fmt.Errorf("%w: empty email", ErrInvalid)
@@ -239,6 +276,12 @@ func (c *Client) CustomerByEmail(ctx context.Context, email string) (*Customer, 
 	var out Customer
 	if err := c.do(ctx, http.MethodGet, "/v1/customers", url.Values{"email": {email}}, nil, &out); err != nil {
 		return nil, err
+	}
+	if err := expectID("customer", out.ID, ""); err != nil {
+		return nil, err
+	}
+	if !strings.EqualFold(out.Email, email) {
+		return nil, fmt.Errorf("%w: no customer with email %q", ErrNotFound, email)
 	}
 	return &out, nil
 }
@@ -255,6 +298,9 @@ func (c *Client) CustomerPortalLink(ctx context.Context, customerID string) (str
 	if err := c.do(ctx, http.MethodPost, "/v1/customers/billing", nil, body, &out); err != nil {
 		return "", err
 	}
+	if out.Link == "" {
+		return "", fmt.Errorf("%w: no portal link", ErrResponse)
+	}
 	return out.Link, nil
 }
 
@@ -265,6 +311,9 @@ func (c *Client) GetTransaction(ctx context.Context, id string) (*Transaction, e
 	}
 	var out Transaction
 	if err := c.do(ctx, http.MethodGet, "/v1/transactions", url.Values{"transaction_id": {id}}, nil, &out); err != nil {
+		return nil, err
+	}
+	if err := expectID("transaction", out.ID, id); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -280,8 +329,10 @@ const (
 )
 
 // RefundTransaction refunds what is left of a transaction and returns the
-// refund's status. The API refunds in full only. The refund.created webhook
-// follows.
+// refund's status. The API refunds in full only. RefundPending and
+// RefundRequiresAction are not a refund yet: the money has not moved, and
+// the refund.created webhook - or a later read of the transaction - says
+// when it has.
 //
 // It is not retried on a 5xx: see the package documentation.
 func (c *Client) RefundTransaction(ctx context.Context, transactionID string) (string, error) {
@@ -295,7 +346,11 @@ func (c *Client) RefundTransaction(ctx context.Context, transactionID string) (s
 	if err := c.do(ctx, http.MethodPost, "/v1/refunds", nil, body, &out); err != nil {
 		return "", err
 	}
-	return out.Status, nil
+	switch out.Status {
+	case RefundPending, RefundRequiresAction, RefundSucceeded, RefundFailed, RefundCanceled:
+		return out.Status, nil
+	}
+	return "", fmt.Errorf("%w: refund status %q", ErrResponse, out.Status)
 }
 
 // ListTransactionsRequest filters ListTransactions. Every field is optional.
@@ -358,9 +413,19 @@ func (c *Client) ListTransactions(ctx context.Context, req *ListTransactionsRequ
 	if err := c.do(ctx, http.MethodGet, "/v1/transactions/search", q, nil, &out); err != nil {
 		return nil, err
 	}
+	for i, tr := range out.Items {
+		if tr.ID == "" {
+			return nil, fmt.Errorf("%w: item %d of the list has no id", ErrResponse, i)
+		}
+	}
 	p := &TransactionPage{Items: out.Items, TotalRecords: out.Pagination.TotalRecords}
-	if out.Pagination.NextPage != nil {
-		p.NextPage = *out.Pagination.NextPage
+	if next := out.Pagination.NextPage; next != nil {
+		// A next page that does not move forward would make a walk repeat
+		// a page forever, or stop early without saying so.
+		if *next <= max(req.Page, 1) {
+			return nil, fmt.Errorf("%w: next page %d after page %d", ErrResponse, *next, max(req.Page, 1))
+		}
+		p.NextPage = *next
 	}
 	return p, nil
 }

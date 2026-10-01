@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strconv"
 	"time"
 )
@@ -46,9 +47,12 @@ func (t *Time) UnmarshalJSON(b []byte) error {
 	default:
 		ms, err := strconv.ParseInt(string(b), 10, 64)
 		if err != nil {
+			// A whole number written as a float ("1.7e12") is accepted; a
+			// fraction, or a value beyond what a float holds exactly, is not
+			// a timestamp Creem sends.
 			f, ferr := strconv.ParseFloat(string(b), 64)
-			if ferr != nil {
-				return fmt.Errorf("creem: time %s: %w", b, err)
+			if ferr != nil || f != math.Trunc(f) || math.Abs(f) > 1<<53 {
+				return fmt.Errorf("creem: time %s is not a whole number of milliseconds", b)
 			}
 			ms = int64(f)
 		}

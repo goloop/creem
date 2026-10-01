@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-10-01
+
+### Fixed
+- A successful response with an empty body, an entity without an id, or
+  another entity than the one asked for is `ErrResponse` instead of an empty
+  result. So is a checkout without a checkout URL, a portal answer without a
+  link, and a refund status the package does not know.
+- `CustomerByEmail` compares the address in the answer and never returns a
+  customer with another one.
+- A list page whose next page does not move forward, or with an item
+  without an id, is `ErrResponse`.
+- `Retry-After` is capped before it is converted, so a huge value no longer
+  overflows into no wait; an HTTP date is read too.
+- `Time` refuses a fraction or an out-of-range float instead of truncating
+  it.
+
+### Added
+- `ErrResponse`.
+- Notes on pending refunds, checking `Mode`, and walking pages that shift.
+
 ## [0.2.0] - 2026-10-01
 
 ### Fixed
