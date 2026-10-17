@@ -403,3 +403,7 @@ Server-side calls a product needs: no product management, licenses, discount
 codes or search pagination. The shared `do` path takes any endpoint.
 
 The package depends only on the standard library.
+
+## Release v1.0.0
+
+Publish the existing payment and webhook API as version 1.0.0. The v1 release keeps the existing import path and public API. Future incompatible changes require a new major version.
